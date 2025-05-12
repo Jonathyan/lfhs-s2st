@@ -140,33 +140,11 @@ class SeamlessS2ST:
         # Move tensor to device AFTER all processing
         audio_tensor = audio_tensor.to(self.device)
         
-        # Extra check om te bevestigen dat audio valide is voor de processor
-        if audio_tensor.dim() == 1:
-            audio_tensor = audio_tensor.unsqueeze(0)  # Add batch dimension
-
-        # Controle op nullen en NaN
-        non_zero = torch.count_nonzero(audio_tensor).item()
-        has_nan = torch.isnan(audio_tensor).any().item()
-        print(f"Audio pre-processor check: shape={audio_tensor.shape}, non-zero={non_zero}, has_nan={has_nan}")
-
-        # Force een kopie op CPU voor diagnose
-        audio_cpu = audio_tensor.cpu().detach().numpy()
-        print(f"Audio stats: min={audio_cpu.min()}, max={audio_cpu.max()}, mean={audio_cpu.mean()}")
-
-        if non_zero == 0:
-            print("WARNING: Audio tensor contains only zeros!")
-            # Vervang door een dummy tone om te testen of dat werkt
-            freq = 440  # Hz
-            sample_rate = 16000
-            time_points = torch.arange(0, 3*sample_rate) / sample_rate
-            audio_tensor = torch.sin(2 * np.pi * freq * time_points).unsqueeze(0).to(self.device)
-            print(f"Replaced with dummy tone, new shape: {audio_tensor.shape}")
-        
         # Zorg voor betere MPS compatibiliteit via correcte dtypes
         try:
             print(f"Calling processor with: audio shape={audio_tensor.shape}, src={src_lang}, tgt={tgt_lang}")
             raw_inputs = self.processor(
-                audios=audio_tensor, 
+                audio=audio_tensor, 
                 src_lang=src_lang,
                 tgt_lang=tgt_lang,
                 return_tensors="pt"
