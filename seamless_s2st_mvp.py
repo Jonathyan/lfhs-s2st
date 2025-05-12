@@ -4,6 +4,7 @@ import numpy as np
 from pathlib import Path
 import torchaudio
 import time
+import traceback
 from typing import List, Tuple, Optional
 
 # Voor chunk-verwerking
@@ -99,7 +100,8 @@ class SeamlessS2ST:
             audio_array = audio_array.reshape(-1, audio_segment.channels).mean(axis=1)
         
         # Normaliseer tussen -1 en 1
-        audio_array = audio_array / (2**(audio_segment.sample_width * 8 - 1))
+        max_possible_value = float(2**(audio_segment.sample_width * 8 - 1))
+        audio_array = audio_array / max_possible_value
         
         # Controleer op NaN/Inf waarden die problemen kunnen veroorzaken
         if np.isnan(audio_array).any() or np.isinf(audio_array).any():
@@ -107,10 +109,10 @@ class SeamlessS2ST:
             audio_array = np.nan_to_num(audio_array)
         
         # Zet om naar torch tensor met EXPLICIET float32 (cruciaal voor MPS)
-        audio_tensor = torch.tensor(audio_array, dtype=torch.float32).to(self.device)
+        audio_tensor = torch.tensor(audio_array, dtype=torch.float32)
         sample_rate = audio_segment.frame_rate
         
-        print(f"Audio tensor ready: shape={audio_tensor.shape}, sr={sample_rate}, min={audio_tensor.min()}, max={audio_tensor.max()}")
+        print(f"Audio tensor ready: shape={audio_tensor.shape}, sr={sample_rate}, min={audio_tensor.min().item()}, max={audio_tensor.max().item()}")
         
         # Resample naar 16kHz als nodig
         if sample_rate != 16000:
@@ -123,9 +125,24 @@ class SeamlessS2ST:
             ).to(dtype=torch.float32)
             audio_tensor = audio_tensor.contiguous()
             sample_rate = 16000
+            
+        print(f"After resampling: shape={audio_tensor.shape}, non-zero elements: {torch.count_nonzero(audio_tensor).item()}")
+        
+        # Debug output voor een kleine sample van de audio
+        if len(audio_tensor) > 1600:  # Show first 0.1 sec at 16kHz if long enough
+            print("First 0.1s audio values:", audio_tensor[:1600:160])  # Just 10 values
+                
+        # Zorg voor juiste dimensies voor de processor (verwacht [batch, time])
+        if audio_tensor.dim() == 1:  # [time] -> [batch, time]
+            audio_tensor = audio_tensor.unsqueeze(0)
+            print(f"Added batch dimension: {audio_tensor.shape}")
+        
+        # Move tensor to device AFTER all processing
+        audio_tensor = audio_tensor.to(self.device)
         
         # Zorg voor betere MPS compatibiliteit via correcte dtypes
         try:
+            print(f"Calling processor with: audio shape={audio_tensor.shape}, src={src_lang}, tgt={tgt_lang}")
             raw_inputs = self.processor(
                 audio=audio_tensor, 
                 src_lang=src_lang,
@@ -134,6 +151,8 @@ class SeamlessS2ST:
             )
             
             print(f"Processor inputs created successfully with keys: {raw_inputs.keys()}")
+            if 'audio_features' in raw_inputs:
+                print(f"Audio features shape: {raw_inputs['audio_features'].shape}")
             
             # Convert inputs to correct dtype and device
             inputs = {k: v.to(dtype=self.dtype, device=self.device) if isinstance(v, torch.Tensor) else v 
@@ -161,6 +180,9 @@ class SeamlessS2ST:
             
         except Exception as e:
             print(f"Error during segment processing: {e}")
+            traceback_str = traceback.format_exc()
+            print(f"Detailed traceback:\n{traceback_str}")
+            
             # Create a silent segment of 5 seconds as a fallback
             print("Returning silent audio as fallback")
             translated_speech = torch.zeros(16000 * 5, dtype=torch.float32)
@@ -364,10 +386,77 @@ def main():
     """
     Hoofdfunctie om de translator uit te voeren
     """
-    # Configureer de paden voor I/O
-    input_path = "input/dutch_sermon.wav"  # Pad naar je Nederlandse preek
-    output_path = "output/indonesian_sermon.wav"  # Pad voor vertaalde audio
-    reference_voice_path = "input/voice_reference.wav"  # Stemreferentie voor kloning
+    import argparse
+    
+    # Command line argumenten voor meer flexibiliteit
+    parser = argparse.ArgumentParser(description='Vertaal Nederlandse audio naar Indonesisch met SeamlessM4T v2')
+    parser.add_argument('--input', type=str, default="input/dutch_sermon.wav", 
+                        help='Pad naar het bronautdiobestand (Nederlands)')
+    parser.add_argument('--output', type=str, default="output/indonesian_sermon.wav",
+                        help='Pad om het vertaalde audiobestand op te slaan')
+    parser.add_argument('--reference', type=str, default="input/voice_reference.wav", 
+                        help='Pad naar stemreferentie voor stemkloning (optioneel)')
+    parser.add_argument('--src-lang', type=str, default="nld", 
+                        help='Brontaal (default: "nld" voor Nederlands)')
+    parser.add_argument('--tgt-lang', type=str, default="ind", 
+                        help='Doeltaal (default: "ind" voor Indonesisch)')
+    parser.add_argument('--device', type=str, default=None, 
+                        help='Device om te gebruiken (default: auto-detect)')
+    parser.add_argument('--chunk-size', type=int, default=30000, 
+                        help='Grootte van audiochunks in ms (default: 30000)')
+    parser.add_argument('--test-mode', action='store_true', 
+                        help='Start in testmodus met gegenereerde testbestanden')
+    
+    args = parser.parse_args()
+    
+    # Configureer de paden
+    input_path = args.input
+    output_path = args.output
+    reference_voice_path = args.reference
+    
+    # Test mode - genereert en gebruikt testbestanden
+    if args.test_mode:
+        print("Starting in TEST MODE with generated test audio files")
+        try:
+            import subprocess
+            
+            # Maak input directory
+            os.makedirs("input", exist_ok=True)
+            
+            # Test of we sox kunnen gebruiken
+            try:
+                subprocess.run(["sox", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                print("Using sox to generate test audio files")
+                
+                # Maak eenvoudige testbestanden met sox
+                subprocess.run(["sox", "-n", "input/test_sermon.wav", "synth", "10", "sine", "300-3000", "vol", "0.5"], 
+                                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                subprocess.run(["sox", "-n", "input/test_voice.wav", "synth", "3", "sine", "440", "vol", "0.5"], 
+                                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
+                input_path = "input/test_sermon.wav"
+                reference_voice_path = "input/test_voice.wav"
+                print(f"Created test files: {input_path} and {reference_voice_path}")
+                
+            except (subprocess.SubprocessError, FileNotFoundError):
+                # Fallback naar torchaudio als sox niet beschikbaar is
+                print("Sox not available, using torchaudio to generate test files")
+                
+                # Maak een testaudio bestand met torchaudio (pure toon)
+                sample_rate = 16000
+                test_audio = torch.sin(2 * np.pi * 440 * torch.arange(sample_rate * 3) / sample_rate).unsqueeze(0)
+                sermon_audio = torch.sin(2 * np.pi * 300 * torch.arange(sample_rate * 10) / sample_rate).unsqueeze(0)
+                
+                torchaudio.save("input/test_voice.wav", test_audio, sample_rate)
+                torchaudio.save("input/test_sermon.wav", sermon_audio, sample_rate)
+                
+                input_path = "input/test_sermon.wav" 
+                reference_voice_path = "input/test_voice.wav"
+                print(f"Created test files: {input_path} and {reference_voice_path}")
+        
+        except Exception as e:
+            print(f"Error creating test files: {e}")
+            print("Continuing with regular mode")
     
     # Check of bestanden bestaan
     if not os.path.exists(input_path):
@@ -376,7 +465,9 @@ def main():
         return
     
     # Maak output directory als nodig
-    os.makedirs("output", exist_ok=True)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     
     # Controleer of stem-referentie bestaat
     use_voice_cloning = os.path.exists(reference_voice_path)
@@ -388,22 +479,54 @@ def main():
         print("Continuing without voice cloning...")
         reference_voice_path = None
     
+    # Bepaal de device (mps, cuda, of cpu)
+    if args.device:
+        device = args.device
+    else:
+        if torch.backends.mps.is_available():
+            device = "mps"
+        elif torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+    
+    # Toon systeeminformatie
+    print(f"System info:")
+    print(f"- PyTorch version: {torch.__version__}")
+    print(f"- Device: {device}")
+    if device == "cuda":
+        print(f"- CUDA version: {torch.version.cuda}")
+        print(f"- GPU: {torch.cuda.get_device_name(0)}")
+    print(f"- Input file: {input_path}")
+    print(f"- Voice reference: {reference_voice_path}")
+    print(f"- Output file: {output_path}")
+    print(f"- Source language: {args.src_lang}")
+    print(f"- Target language: {args.tgt_lang}")
+    print(f"- Chunk size: {args.chunk_size}ms")
+    
     # Initialiseer de translator
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
     translator = SeamlessS2ST(device=device, dtype=torch.float32)
+    translator.chunk_size_ms = args.chunk_size
     
     # Voer de vertaling uit
-    translator.translate_long_audio(
-        input_path=input_path,
-        output_path=output_path,
-        reference_audio_path=reference_voice_path,
-        src_lang="nld",
-        tgt_lang="ind"
-    )
-    
-    print("\nMVP Translation Process Complete!")
-    print("----------------------------")
-    print(f"Output file: {output_path}")
+    try:
+        translator.translate_long_audio(
+            input_path=input_path,
+            output_path=output_path,
+            reference_audio_path=reference_voice_path,
+            src_lang=args.src_lang,
+            tgt_lang=args.tgt_lang
+        )
+        
+        print("\nMVP Translation Process Complete!")
+        print("----------------------------")
+        print(f"Output file: {output_path}")
+        
+    except Exception as e:
+        print(f"Error during translation: {e}")
+        traceback_str = traceback.format_exc()
+        print(f"Detailed traceback:\n{traceback_str}")
+        print("Translation failed. Check the error messages above for details.")
 
 
 if __name__ == "__main__":
