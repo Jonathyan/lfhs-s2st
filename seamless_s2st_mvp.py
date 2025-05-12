@@ -71,10 +71,10 @@ class SeamlessS2ST:
         return segments
     
     def process_segment(self, 
-                       audio_segment: AudioSegment,
-                       reference_speech: Optional[torch.Tensor] = None,
-                       src_lang: str = "nld", 
-                       tgt_lang: str = "ind") -> Tuple[torch.Tensor, float]:
+                    audio_segment: AudioSegment,
+                    reference_speech: Optional[torch.Tensor] = None,
+                    src_lang: str = "nld", 
+                    tgt_lang: str = "ind") -> Tuple[torch.Tensor, float]:
         """
         Verwerk een audiosegment: spraak-naar-spraak vertaling met stemkloning.
         
@@ -134,27 +134,47 @@ class SeamlessS2ST:
                 
         # Zorg voor juiste dimensies voor de processor (verwacht [batch, time])
         if audio_tensor.dim() == 1:  # [time] -> [batch, time]
-            audio_tensor = audio_tensor.unsqueeze(0)
+            audio_tensor = audio_tensor.unsqueeze(0)  # Add batch dimension
             print(f"Added batch dimension: {audio_tensor.shape}")
         
-        # Move tensor to device AFTER all processing
-        audio_tensor = audio_tensor.to(self.device)
+        # Controle op nullen en NaN
+        non_zero = torch.count_nonzero(audio_tensor).item()
+        has_nan = torch.isnan(audio_tensor).any().item()
+        print(f"Audio pre-processor check: shape={audio_tensor.shape}, non-zero={non_zero}, has_nan={has_nan}")
+        
+        # Force een kopie op CPU voor diagnose
+        audio_cpu = audio_tensor.cpu().detach().numpy()
+        print(f"Audio stats: min={audio_cpu.min()}, max={audio_cpu.max()}, mean={audio_cpu.mean()}")
+        
+        # BELANGRIJK: HOUD DE TENSOR OP CPU VOOR PROCESSOR!
+        # De processor feature extractor heeft problemen met MPS tensors
+        # omdat het direct naar numpy probeert te converteren
         
         # Zorg voor betere MPS compatibiliteit via correcte dtypes
         try:
             print(f"Calling processor with: audio shape={audio_tensor.shape}, src={src_lang}, tgt={tgt_lang}")
-            raw_inputs = self.processor(
-                audios=audio_tensor, 
-                src_lang=src_lang,
-                tgt_lang=tgt_lang,
-                return_tensors="pt"
-            )
+            
+            # BELANGRIJK: Gebruik CPU tensor (MPS kan niet direct naar numpy)
+            # en gebruik 'audios' parameter in plaats van 'audio'
+            processor_inputs = {
+                "audios": audio_tensor.cpu(),  # CPU tensor! Essentieel voor MPS compatibiliteit
+                "src_lang": src_lang,
+                "tgt_lang": tgt_lang,
+                "return_tensors": "pt",
+                "sampling_rate": sample_rate  # Expliciete sampling rate meegeven
+            }
+            
+            print(f"Processor inputs: {processor_inputs.keys()}")
+            print(f"Audio tensor in inputs: shape={processor_inputs['audios'].shape}, device={processor_inputs['audios'].device}")
+            
+            # Aanroep processor met expliciete dictionary
+            raw_inputs = self.processor(**processor_inputs)
             
             print(f"Processor inputs created successfully with keys: {raw_inputs.keys()}")
             if 'audio_features' in raw_inputs:
                 print(f"Audio features shape: {raw_inputs['audio_features'].shape}")
             
-            # Convert inputs to correct dtype and device
+            # Convert inputs to correct dtype and device (naar MPS)
             inputs = {k: v.to(dtype=self.dtype, device=self.device) if isinstance(v, torch.Tensor) else v 
                     for k, v in raw_inputs.items()}
             
@@ -270,17 +290,23 @@ class SeamlessS2ST:
         if audio.abs().max() < 1e-6:
             print("WARNING: Audio is almost silent, this may cause voice embedding issues")
         
-        audio = audio.to(self.device)
-            
+        # BELANGRIJK: Houd de audio op CPU voor processor aanroep
         # Extract speaker embedding
         with torch.no_grad():
             try:
-                raw_inputs = self.processor(audio=audio, return_tensors="pt")
-                print(f"Processor inputs created successfully with keys: {raw_inputs.keys()}")
+                # Gebruik expliciet CPU tensor en audios parameter, net als bij process_segment
+                processor_inputs = {
+                    "audios": audio.cpu(),
+                    "return_tensors": "pt",
+                    "sampling_rate": 16000
+                }
                 
-                # Convert inputs to correct dtype and device
+                print(f"Processor inputs for voice embedding: {processor_inputs.keys()}")
+                raw_inputs = self.processor(**processor_inputs)
+                
+                # Verplaats alleen de output tensors naar MPS device
                 inputs = {k: v.to(dtype=self.dtype, device=self.device) if isinstance(v, torch.Tensor) else v 
-                         for k, v in raw_inputs.items()}
+                        for k, v in raw_inputs.items()}
                 
                 speaker_embedding = self.model.extract_speaker_embedding(**inputs)
                 print(f"Speaker embedding extracted successfully: shape={speaker_embedding.shape}")
@@ -288,6 +314,8 @@ class SeamlessS2ST:
                 return speaker_embedding
             except Exception as e:
                 print(f"Error in voice embedding extraction: {e}")
+                traceback_str = traceback.format_exc()
+                print(f"Detailed traceback:\n{traceback_str}")
                 # Als fallback, maak een dummy embedding (hiermee is stemkloning niet mogelijk maar voorkomt crashes)
                 print("Using dummy speaker embedding as fallback - voice cloning will not work properly")
                 return None
