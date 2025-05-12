@@ -88,6 +88,10 @@ class SeamlessS2ST:
         """
         start_time = time.time()
         
+        # Controleer of het segment geluid bevat
+        if len(audio_segment) == 0 or audio_segment.dBFS < -60:
+            print("Warning: Audio segment is silent or empty. This may cause issues.")
+        
         # Converteer AudioSegment naar tensor
         audio_array = np.array(audio_segment.get_array_of_samples(), dtype=np.float32)
         if audio_segment.channels > 1:
@@ -97,12 +101,20 @@ class SeamlessS2ST:
         # Normaliseer tussen -1 en 1
         audio_array = audio_array / (2**(audio_segment.sample_width * 8 - 1))
         
+        # Controleer op NaN/Inf waarden die problemen kunnen veroorzaken
+        if np.isnan(audio_array).any() or np.isinf(audio_array).any():
+            print("WARNING: Audio contains NaN or Inf values, replacing with zeros")
+            audio_array = np.nan_to_num(audio_array)
+        
         # Zet om naar torch tensor met EXPLICIET float32 (cruciaal voor MPS)
         audio_tensor = torch.tensor(audio_array, dtype=torch.float32).to(self.device)
         sample_rate = audio_segment.frame_rate
         
+        print(f"Audio tensor ready: shape={audio_tensor.shape}, sr={sample_rate}, min={audio_tensor.min()}, max={audio_tensor.max()}")
+        
         # Resample naar 16kHz als nodig
         if sample_rate != 16000:
+            print(f"Resampling from {sample_rate}Hz to 16000Hz")
             # Ensure correct dtype for MPS compatibility
             audio_tensor = torchaudio.functional.resample(
                 audio_tensor, 
@@ -113,33 +125,45 @@ class SeamlessS2ST:
             sample_rate = 16000
         
         # Zorg voor betere MPS compatibiliteit via correcte dtypes
-        raw_inputs = self.processor(
-            audio=audio_tensor, 
-            src_lang=src_lang,
-            tgt_lang=tgt_lang,
-            return_tensors="pt"
-        )
-        
-        # Convert inputs to correct dtype and device
-        inputs = {k: v.to(dtype=self.dtype, device=self.device) if isinstance(v, torch.Tensor) else v 
-                 for k, v in raw_inputs.items()}
-        
-        with torch.no_grad():
-            # Generate met of zonder voice cloning
-            if reference_speech is not None:
-                generated_speech = self.model.generate(
-                    **inputs,
-                    speaker_embedding=reference_speech,
-                    return_intermediate_token_ids=True
-                )
-            else:
-                generated_speech = self.model.generate(
-                    **inputs,
-                    return_intermediate_token_ids=True
-                )
-        
-        # Extract speech output
-        translated_speech = generated_speech.waveform[0].cpu()
+        try:
+            raw_inputs = self.processor(
+                audio=audio_tensor, 
+                src_lang=src_lang,
+                tgt_lang=tgt_lang,
+                return_tensors="pt"
+            )
+            
+            print(f"Processor inputs created successfully with keys: {raw_inputs.keys()}")
+            
+            # Convert inputs to correct dtype and device
+            inputs = {k: v.to(dtype=self.dtype, device=self.device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in raw_inputs.items()}
+            
+            with torch.no_grad():
+                # Generate met of zonder voice cloning
+                if reference_speech is not None:
+                    print("Using voice cloning for generation")
+                    generated_speech = self.model.generate(
+                        **inputs,
+                        speaker_embedding=reference_speech,
+                        return_intermediate_token_ids=True
+                    )
+                else:
+                    print("Generating without voice cloning")
+                    generated_speech = self.model.generate(
+                        **inputs,
+                        return_intermediate_token_ids=True
+                    )
+            
+            # Extract speech output
+            translated_speech = generated_speech.waveform[0].cpu()
+            print(f"Translation successful: output shape={translated_speech.shape}")
+            
+        except Exception as e:
+            print(f"Error during segment processing: {e}")
+            # Create a silent segment of 5 seconds as a fallback
+            print("Returning silent audio as fallback")
+            translated_speech = torch.zeros(16000 * 5, dtype=torch.float32)
         
         elapsed_time = time.time() - start_time
         return translated_speech, elapsed_time
@@ -156,12 +180,46 @@ class SeamlessS2ST:
         """
         print(f"Extracting voice embedding from: {reference_audio_path}")
         
-        # Laad referentie-audio
-        audio, sr = torchaudio.load(reference_audio_path, normalize=True)
+        # Controleer of het bestand bestaat en toegankelijk is
+        if not os.path.isfile(reference_audio_path):
+            raise FileNotFoundError(f"Voice reference file not found: {reference_audio_path}")
+            
+        print(f"File exists and is accessible: {reference_audio_path}")
+        print(f"File size: {os.path.getsize(reference_audio_path)} bytes")
+        
+        # Gebruik pydub om de audio te laden en te controleren
+        try:
+            audio_segment = AudioSegment.from_file(reference_audio_path)
+            print(f"Successfully loaded with pydub: {len(audio_segment)/1000}s, {audio_segment.channels} channels, {audio_segment.frame_rate}Hz")
+            
+            # Converteer AudioSegment naar numpy array en dan naar torch tensor
+            samples = np.array(audio_segment.get_array_of_samples(), dtype=np.float32)
+            if audio_segment.channels > 1:
+                samples = samples.reshape(-1, audio_segment.channels).mean(axis=1)
+            
+            # Normaliseer tussen -1 en 1
+            samples = samples / (2**(audio_segment.sample_width * 8 - 1))
+            
+            # Converteer naar torch tensor
+            audio = torch.tensor(samples, dtype=torch.float32).unsqueeze(0)  # Add channel dimension
+            sr = audio_segment.frame_rate
+            
+            print(f"Converted to tensor: shape={audio.shape}, dtype={audio.dtype}, sr={sr}")
+        except Exception as e:
+            print(f"Error loading with pydub: {e}")
+            # Fallback naar torchaudio als backup
+            try:
+                audio, sr = torchaudio.load(reference_audio_path)
+                print(f"Fallback: torchaudio loaded shape={audio.shape}, sr={sr}")
+            except Exception as e:
+                print(f"Critical error loading audio: {e}")
+                raise
+        
         # Zorg ervoor dat we float32 gebruiken (MPS vereiste)
         audio = audio.to(dtype=torch.float32)
         
         if sr != 16000:
+            print(f"Resampling from {sr}Hz to 16000Hz")
             audio = torchaudio.functional.resample(
                 audio, 
                 orig_freq=sr, 
@@ -170,23 +228,47 @@ class SeamlessS2ST:
         
         # Zorg voor mono audio
         if audio.shape[0] > 1:
+            print(f"Converting from {audio.shape[0]} channels to mono")
             audio = audio.mean(dim=0, keepdim=True).to(dtype=torch.float32)
         
         # Zorg dat het niet te lang is (neem max 10 seconden)
         if audio.shape[1] > 160000:  # 10 sec at 16kHz
+            print(f"Trimming audio from {audio.shape[1]/16000}s to 10s")
             audio = audio[:, :160000].contiguous()
-            
+        
+        # Debug info
+        print(f"Final audio tensor: shape={audio.shape}, dtype={audio.dtype}, min={audio.min()}, max={audio.max()}")
+        
+        # Controleer op NaN/Inf waarden die problemen kunnen veroorzaken
+        if torch.isnan(audio).any() or torch.isinf(audio).any():
+            print("WARNING: Audio contains NaN or Inf values, replacing with zeros")
+            audio = torch.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Zorg dat de audio niet stil is
+        if audio.abs().max() < 1e-6:
+            print("WARNING: Audio is almost silent, this may cause voice embedding issues")
+        
         audio = audio.to(self.device)
             
         # Extract speaker embedding
         with torch.no_grad():
-            raw_inputs = self.processor(audio=audio, return_tensors="pt")
-            # Convert inputs to correct dtype and device
-            inputs = {k: v.to(dtype=self.dtype, device=self.device) if isinstance(v, torch.Tensor) else v 
-                     for k, v in raw_inputs.items()}
-            speaker_embedding = self.model.extract_speaker_embedding(**inputs)
-            
-        return speaker_embedding
+            try:
+                raw_inputs = self.processor(audio=audio, return_tensors="pt")
+                print(f"Processor inputs created successfully with keys: {raw_inputs.keys()}")
+                
+                # Convert inputs to correct dtype and device
+                inputs = {k: v.to(dtype=self.dtype, device=self.device) if isinstance(v, torch.Tensor) else v 
+                         for k, v in raw_inputs.items()}
+                
+                speaker_embedding = self.model.extract_speaker_embedding(**inputs)
+                print(f"Speaker embedding extracted successfully: shape={speaker_embedding.shape}")
+                
+                return speaker_embedding
+            except Exception as e:
+                print(f"Error in voice embedding extraction: {e}")
+                # Als fallback, maak een dummy embedding (hiermee is stemkloning niet mogelijk maar voorkomt crashes)
+                print("Using dummy speaker embedding as fallback - voice cloning will not work properly")
+                return None
     
     def translate_long_audio(self, 
                            input_path: str, 
@@ -210,25 +292,50 @@ class SeamlessS2ST:
         start_time = time.time()
         print(f"Starting translation of {input_path} from {src_lang} to {tgt_lang}")
         
+        # Controleer of inputbestand bestaat
+        if not os.path.isfile(input_path):
+            raise FileNotFoundError(f"Input audio file not found: {input_path}")
+        
+        print(f"Input file exists and is accessible: {input_path}")
+        print(f"Input file size: {os.path.getsize(input_path)} bytes")
+        
         # Extract voice embedding if provided
         speaker_embedding = None
         if reference_audio_path:
-            speaker_embedding = self.extract_voice_embedding(reference_audio_path)
-            print("Voice embedding extracted successfully")
+            try:
+                speaker_embedding = self.extract_voice_embedding(reference_audio_path)
+                if speaker_embedding is not None:
+                    print("Voice embedding extracted successfully")
+                else:
+                    print("Warning: Voice embedding could not be extracted, continuing without voice cloning")
+            except Exception as e:
+                print(f"Error extracting voice embedding: {e}")
+                print("Continuing without voice cloning...")
         
         # Segment audio into manageable chunks
         segments = self.segment_audio(input_path)
         total_segments = len(segments)
         
+        if total_segments == 0:
+            raise ValueError(f"No audio segments were extracted from {input_path}. The file may be empty or corrupted.")
+        
         # Process each segment
         translated_segments = []
         for i, segment in enumerate(segments):
             print(f"Processing segment {i+1}/{total_segments}")
-            translated_audio, proc_time = self.process_segment(
-                segment, speaker_embedding, src_lang, tgt_lang
-            )
-            translated_segments.append(translated_audio)
-            print(f"Segment {i+1} processed in {proc_time:.2f}s")
+            try:
+                translated_audio, proc_time = self.process_segment(
+                    segment, speaker_embedding, src_lang, tgt_lang
+                )
+                translated_segments.append(translated_audio)
+                print(f"Segment {i+1} processed in {proc_time:.2f}s")
+            except Exception as e:
+                print(f"Error processing segment {i+1}: {e}")
+                print("Skipping this segment and continuing...")
+                continue
+        
+        if not translated_segments:
+            raise RuntimeError("No segments were successfully translated. Cannot create output file.")
         
         # Combine translated segments
         print("Combining translated segments...")
