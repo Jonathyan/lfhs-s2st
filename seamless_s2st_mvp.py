@@ -166,7 +166,7 @@ class SeamlessS2ST:
         try:
             print(f"Calling processor with: audio shape={audio_tensor.shape}, src={src_lang}, tgt={tgt_lang}")
             raw_inputs = self.processor(
-                audio=audio_tensor, 
+                audios=audio_tensor, 
                 src_lang=src_lang,
                 tgt_lang=tgt_lang,
                 return_tensors="pt"
