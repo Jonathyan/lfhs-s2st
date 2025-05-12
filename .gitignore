@@ -1,0 +1,50 @@
+# Audio bestanden om te verwerken
+input/
+output/
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+ENV/
+virtualenv/
+pythonenv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+logs/
+
+# IDE specifieke bestanden
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+
+# Build gerelateerde bestanden
+dist/
+build/
+*.egg-info/
+
+# Configuratie bestanden met secrets
+.env
+.env.local
+config.ini
+credentials.json
+secrets.yaml
+
+# Data bestanden (afhankelijk van je project)
+*.csv
+*.xls
+*.xlsx
+*.db
+*.sqlite3
