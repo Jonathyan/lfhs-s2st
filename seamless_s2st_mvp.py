@@ -1,23 +1,3 @@
-"""
-Nederlands naar Indonesisch S2ST MVP met SeamlessM4T v2
--------------------------------------------
-
-Deze code creëert een minimaal werkende vertaaloplossing die:
-1. Een Nederlandse audio-opname (~1,5 uur) inleest
-2. De spraak naar tekst omzet (ASR)
-3. De tekst vertaalt naar Indonesisch
-4. Indonesische spraak genereert met voice cloning (TTS)
-5. De resulterende audio opslaat
-
-Vereisten:
-- Python 3.9+
-- PyTorch 2.0+
-- seamless_communication (Meta's package)
-- ffmpeg (voor audiobewerking)
-- ~8GB RAM beschikbaar
-- M1 Pro CPU/GPU wordt benut
-"""
-
 import os
 import torch
 import numpy as np
@@ -28,10 +8,7 @@ from typing import List, Tuple, Optional
 
 # Voor chunk-verwerking
 from pydub import AudioSegment
-
-# Import seamless_communication components
-from seamless_communication.inference.translator import Translator
-# from seamless_communication.cli.m4t.predict import predict_all
+from transformers import AutoProcessor, SeamlessM4Tv2ForSpeechToSpeech, SeamlessM4Tv2Model
 
 class SeamlessS2ST:
     """
@@ -39,33 +16,24 @@ class SeamlessS2ST:
     met stemkloning gebruikmakend van SeamlessM4T v2.
     """
     
-    def __init__(self, device="mps"):
+    def __init__(self, device="mps", dtype=torch.float32):
         """
         Initialiseer de S2ST-vertaler met modellen voor M1 Pro.
         
         Args:
             device: 'mps' voor M1 Mac (Metal Performance Shaders)
+            dtype: datatype voor tensors (moet float32 zijn voor MPS)
         """
         self.device = device
-        print(f"Initializing SeamlessM4T v2 on {device}...")
+        self.dtype = dtype
+        print(f"Initializing SeamlessM4T v2 on {device} with {dtype}...")
         
-        # # Load SeamlessM4T v2 translator
-        # self.translator = Translator(
-        #     model_name_or_path="seamlessM4T_v2_large",
-        #     vocoder_name_or_path="vocoder_v2",
-        #     device=torch.device(device)
-        # )
+        # Load SeamlessM4T v2 models and processor
+        self.processor = AutoProcessor.from_pretrained("facebook/seamless-m4t-v2-large")
+        self.model = SeamlessM4Tv2ForSpeechToSpeech.from_pretrained(
+            "facebook/seamless-m4t-v2-large"
+        ).to(device)
         
-        # Load SeamlessM4T v2 translator
-        self.translator = Translator(
-            "seamlessM4T_v2_large",  # model name
-            "vocoder_v2",            # vocoder name
-            device=torch.device(device),    # device
-            dtype=torch.float32            # dtype (using float32 for M1 Mac compatibility)
-        )
-
-
-
         print("Models loaded successfully!")
         
         # Default segmentation parameters (kan aangepast worden)
@@ -129,51 +97,96 @@ class SeamlessS2ST:
         # Normaliseer tussen -1 en 1
         audio_array = audio_array / (2**(audio_segment.sample_width * 8 - 1))
         
-        # Zet om naar torch tensor
-        audio_tensor = torch.tensor(audio_array).to(self.device)
+        # Zet om naar torch tensor met EXPLICIET float32 (cruciaal voor MPS)
+        audio_tensor = torch.tensor(audio_array, dtype=torch.float32).to(self.device)
         sample_rate = audio_segment.frame_rate
         
         # Resample naar 16kHz als nodig
         if sample_rate != 16000:
+            # Ensure correct dtype for MPS compatibility
             audio_tensor = torchaudio.functional.resample(
-                audio_tensor, orig_freq=sample_rate, new_freq=16000
-            )
+                audio_tensor, 
+                orig_freq=sample_rate, 
+                new_freq=16000
+            ).to(dtype=torch.float32)
+            audio_tensor = audio_tensor.contiguous()
             sample_rate = 16000
         
-        # Gebruik de seamless_communication Translator voor vertaling
+        # Zorg voor betere MPS compatibiliteit via correcte dtypes
+        raw_inputs = self.processor(
+            audio=audio_tensor, 
+            src_lang=src_lang,
+            tgt_lang=tgt_lang,
+            return_tensors="pt"
+        )
+        
+        # Convert inputs to correct dtype and device
+        inputs = {k: v.to(dtype=self.dtype, device=self.device) if isinstance(v, torch.Tensor) else v 
+                 for k, v in raw_inputs.items()}
+        
         with torch.no_grad():
-            text_output, wav_output, _ = self.translator.predict(
-                input=audio_tensor,
-                task_str="s2st",  # speech-to-speech translation
-                tgt_lang=tgt_lang,
-                src_lang=src_lang,
-                spkr_id=reference_speech if reference_speech is not None else None,
-                return_type="waveform"
-            )
+            # Generate met of zonder voice cloning
+            if reference_speech is not None:
+                generated_speech = self.model.generate(
+                    **inputs,
+                    speaker_embedding=reference_speech,
+                    return_intermediate_token_ids=True
+                )
+            else:
+                generated_speech = self.model.generate(
+                    **inputs,
+                    return_intermediate_token_ids=True
+                )
         
         # Extract speech output
-        translated_speech = wav_output.cpu()
+        translated_speech = generated_speech.waveform[0].cpu()
         
         elapsed_time = time.time() - start_time
         return translated_speech, elapsed_time
     
-    def extract_voice_embedding(self, reference_audio_path: str) -> int:
+    def extract_voice_embedding(self, reference_audio_path: str) -> torch.Tensor:
         """
         Extraheer stem-embedding voor voice cloning.
-        In seamless_communication wordt dit anders gedaan - we gebruiken een speaker ID.
         
         Args:
             reference_audio_path: Pad naar referentie-audio voor stemkloning
             
         Returns:
-            Speaker ID (in dit geval gebruiken we 0 als placeholder)
+            Stem-embedding tensor
         """
-        print(f"Using reference voice from: {reference_audio_path}")
+        print(f"Extracting voice embedding from: {reference_audio_path}")
         
-        # In de nieuwe API gebruiken we het audiopad direct
-        # We geven hier 0 terug als placeholder voor de speaker ID
-        # De echte audio wordt later gebruikt
-        return 0
+        # Laad referentie-audio
+        audio, sr = torchaudio.load(reference_audio_path, normalize=True)
+        # Zorg ervoor dat we float32 gebruiken (MPS vereiste)
+        audio = audio.to(dtype=torch.float32)
+        
+        if sr != 16000:
+            audio = torchaudio.functional.resample(
+                audio, 
+                orig_freq=sr, 
+                new_freq=16000
+            ).to(dtype=torch.float32)
+        
+        # Zorg voor mono audio
+        if audio.shape[0] > 1:
+            audio = audio.mean(dim=0, keepdim=True).to(dtype=torch.float32)
+        
+        # Zorg dat het niet te lang is (neem max 10 seconden)
+        if audio.shape[1] > 160000:  # 10 sec at 16kHz
+            audio = audio[:, :160000].contiguous()
+            
+        audio = audio.to(self.device)
+            
+        # Extract speaker embedding
+        with torch.no_grad():
+            raw_inputs = self.processor(audio=audio, return_tensors="pt")
+            # Convert inputs to correct dtype and device
+            inputs = {k: v.to(dtype=self.dtype, device=self.device) if isinstance(v, torch.Tensor) else v 
+                     for k, v in raw_inputs.items()}
+            speaker_embedding = self.model.extract_speaker_embedding(**inputs)
+            
+        return speaker_embedding
     
     def translate_long_audio(self, 
                            input_path: str, 
@@ -199,9 +212,9 @@ class SeamlessS2ST:
         
         # Extract voice embedding if provided
         speaker_embedding = None
-        if reference_audio_path and os.path.exists(reference_audio_path):
+        if reference_audio_path:
             speaker_embedding = self.extract_voice_embedding(reference_audio_path)
-            print("Voice reference will be used for translation")
+            print("Voice embedding extracted successfully")
         
         # Segment audio into manageable chunks
         segments = self.segment_audio(input_path)
@@ -260,14 +273,17 @@ def main():
     
     # Controleer of stem-referentie bestaat
     use_voice_cloning = os.path.exists(reference_voice_path)
-    if not use_voice_cloning:
+    if use_voice_cloning:
+        print(f"Using reference voice from: {reference_voice_path}")
+        print("Voice reference will be used for translation")
+    else:
         print(f"Warning: Voice reference file not found: {reference_voice_path}")
         print("Continuing without voice cloning...")
         reference_voice_path = None
     
     # Initialiseer de translator
     device = "mps" if torch.backends.mps.is_available() else "cpu"
-    translator = SeamlessS2ST(device=device)
+    translator = SeamlessS2ST(device=device, dtype=torch.float32)
     
     # Voer de vertaling uit
     translator.translate_long_audio(
