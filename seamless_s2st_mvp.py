@@ -184,6 +184,7 @@ class SeamlessS2ST:
                     print("Using voice cloning for generation")
                     generated_speech = self.model.generate(
                         **inputs,
+                        tgt_lang=tgt_lang,  # Explicitly add target language here
                         speaker_embedding=reference_speech,
                         return_intermediate_token_ids=True
                     )
@@ -191,8 +192,10 @@ class SeamlessS2ST:
                     print("Generating without voice cloning")
                     generated_speech = self.model.generate(
                         **inputs,
+                        tgt_lang=tgt_lang,  # Explicitly add target language here
                         return_intermediate_token_ids=True
                     )
+
             
             # Extract speech output
             translated_speech = generated_speech.waveform[0].cpu()
